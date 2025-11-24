@@ -108,18 +108,6 @@ des_proc* rimozione_lista(des_proc*& p_lista)
 	return p_elem;
 }
 
-//////////////////////////////////////////////
-//////////////////////////////////////////////
-
-extern "C" void c_inutile(int a, int b) 
-{
- 	int r = a + b + esecuzione->precedenza;
-	esecuzione->contesto[I_RAX] = r;
-}
-
-//////////////////////////////////////////////
-//////////////////////////////////////////////
-
 /// @brief Inserisce @ref esecuzione in testa alla lista @ref pronti
 extern "C" void inspronti()
 {
@@ -410,8 +398,25 @@ void process_dump(des_proc*, log_sev sev);
  *  @param errore	eventuale codice di errore aggiuntivo
  *  @param rip		instruction pointer salvato in pila
  */
+
+ // !!! [ASTRA] Forward declaration della funzione in fondo
+ bool gestore_page_fault(vaddr fault_addr);
+ // Forward declaration per leggere il registro CR2 (indirizzo del fault)
+ extern "C" vaddr readCR2();
+
 extern "C" void gestore_eccezioni(int tipo, natq errore, vaddr rip)
 {
+    // [ASTRA] FASE 1: Gestione Page Fault (#14)
+    if (tipo == 14) {
+        vaddr fault_addr = readCR2();
+        
+        // Proviamo a gestire il fault. Se restituisce true, problema risolto.
+        if (gestore_page_fault(fault_addr)) {
+            return; // Ritorna subito per rieseguire l'istruzione
+        }
+        // Se restituisce false, lasciamo che il codice qui sotto faccia panic/abort
+    }
+
 	log_exception(tipo, errore, rip);
 
 	if (tipo != 14 && (errore & SE_EXT)) {
@@ -959,12 +964,18 @@ des_proc* crea_processo(void f(natq), natq a, int prio, char liv)
 		// passerà ad eseguire la prima istruzione della funzione f,
 		// usando come pila la pila utente (al suo indirizzo virtuale)
 
-		// creazione della pila utente
-		static_assert(DIM_USR_STACK > 0 && (DIM_USR_STACK & 0xFFF) == 0);
-		if (!crea_pila(p->cr3, fin_utn_p, DIM_USR_STACK, LIV_UTENTE)) {
-			flog(LOG_WARN, "crea_processo: creazione pila utente fallita");
-			goto err_del_sstack;
-		}
+// !!! [ASTRA] FASE 1: Disabilitiamo la creazione statica della pila.
+        // La pila verrà creata dinamicamente dal Page Fault Handler.
+        /*
+        static_assert(DIM_USR_STACK > 0 && (DIM_USR_STACK & 0xFFF) == 0);
+        if (!crea_pila(p->cr3, fin_utn_p, DIM_USR_STACK, LIV_UTENTE)) {
+            flog(LOG_WARN, "crea_processo: creazione pila utente fallita");
+            goto err_del_sstack;
+        }
+        */
+
+        // NOTA: p->contesto[I_RSP] punta ancora a fin_utn_p (virtuale), 
+        // ma quella memoria non è mappata fisicamente!!!
 
 		// inizialmente, il processo si trova a livello sistema, come
 		// se avesse eseguito una istruzione INT, con la pila sistema
@@ -1842,5 +1853,65 @@ void process_dump(des_proc* p, log_sev sev)
 
 	cfi_dump(cfi, sev);
 }
+
+
+// ============================================================================
+// !!! [ASTRA] IMPLEMENTAZIONE FASE 1
+// ============================================================================
+
+// Helper per verificare se l'indirizzo è nello stack utente
+bool is_valid_stack_address(vaddr v) {
+    // Calcoliamo l'inizio dello stack (es. 0 - 64KB = 0xFFFFFFFFFFFF0000)
+    vaddr stack_start = fin_utn_p - DIM_USR_STACK;
+
+    if (fin_utn_p == 0) {
+        // Caso speciale: la pila tocca la fine della memoria (wrap-around a 0).
+        // Dato che v è unsigned, non può essere "minore" di 0.
+        // Ci basta controllare che sia sopra l'inizio.
+        return v >= stack_start;
+    } else {
+        // Caso normale
+        return (v >= stack_start) && (v < fin_utn_p);
+    }
+}
+
+// Handler vero e proprio
+bool gestore_page_fault(vaddr fault_addr) {
+    // 1. Controllo validità: è un indirizzo della pila utente?
+    if (!is_valid_stack_address(fault_addr)) {
+        flog(LOG_WARN, "Astra: Page Fault non gestito a %lx (fuori stack)", fault_addr);
+        return false; // Non gestito -> Abort
+    }
+
+    flog(LOG_INFO, "Astra: Demand Paging per %lx (Proc %d)", fault_addr, esecuzione->id);
+
+    // 2. Alloca un frame fisico
+    paddr new_frame = alloca_frame();
+    if (new_frame == 0) {
+        panic("Astra: Memoria esaurita (Fase 1 - No Swap)");
+    }
+
+    // 3. Mappa il frame
+    // Calcola l'inizio della pagina (allineamento a 4KiB)
+    vaddr page_base = fault_addr & ~(DIM_PAGINA - 1);
+
+    // map vuole una funzione che restituisca il paddr. Usiamo una lambda.
+    auto get_frame = [new_frame](vaddr v) -> paddr { return new_frame; };
+
+    map(esecuzione->cr3, page_base, page_base + DIM_PAGINA, 
+    BIT_US | BIT_RW, get_frame);
+
+    // 4. Pulisci il frame (Sicurezza)
+    // Usiamo la finestra FM per scrivere nello spazio fisico
+  	memset(voidptr_cast(new_frame), 0, DIM_PAGINA);
+
+    // 5. Invalida TLB (Opzionale ma buona pratica su x86 dopo map)
+    // Qui non serve strettamente perché è un fault su pagina non presente,
+    // ma in futuro servirà.
+    invalida_entrata_TLB(page_base);
+
+    return true; // Fault gestito con successo
+}
+
 /// @}
 /// @}

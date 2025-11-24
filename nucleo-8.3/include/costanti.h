@@ -42,8 +42,6 @@
 #define TIPO_L			0x26	///< do_log()
 #define TIPO_GMI		0x27	///< getmeminfo()
 #define TIPO_AB			0x28	///< abort_p()
-
-#define TIPO_I            0x29	   
 /// @}
 
 /// @name Primitive riservate per il modulo I/O

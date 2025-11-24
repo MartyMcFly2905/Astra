@@ -16,3 +16,10 @@ doc/
 # File di sistema e IDE
 .DS_Store
 .vscode/
+
+# Appunti personali
+*.md
+
+# Cartelle per testing
+libce-4.3/
+qemu-ce-9.2.2-3/

@@ -1,0 +1,18 @@
+# File di build e oggetti
+build/
+*.o
+*.d
+
+# Immagine disco
+share/hd.img
+
+# Log di sistema e debug
+log/
+*.log
+
+# Documentazione generata
+doc/
+
+# File di sistema e IDE
+.DS_Store
+.vscode/

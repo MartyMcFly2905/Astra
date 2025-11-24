@@ -140,14 +140,5 @@ getiomeminfo:
 	ret
 	.cfi_endproc
 
-//////////////////////////////////////////
-
-	.global inutile
-inutile:
-	.cfi_startproc
-	int $TIPO_I
-	ret
-	.cfi_endproc
-
 /// @endcond
 /// @}

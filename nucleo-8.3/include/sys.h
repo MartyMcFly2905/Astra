@@ -7,8 +7,6 @@
 /// @name Primitive per la gestione dei processi
 /// @{
 
-extern "C" int inutile(int a, int b);
-
 
 /**
  * @brief Crea un nuovo processo

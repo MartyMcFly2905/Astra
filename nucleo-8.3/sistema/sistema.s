@@ -243,8 +243,6 @@ init_idt:
 	carica_gate	TIPO_L		a_do_log	LIV_UTENTE
 	carica_gate	TIPO_GMI	a_getmeminfo	LIV_UTENTE
 
-	carica_gate TIPO_I 		a_inutile 	LIV_UTENTE
-
 	// primitive per il livello I/O (tipi 0x3-)
 	carica_gate	TIPO_APE	a_activate_pe	LIV_SISTEMA
 	carica_gate	TIPO_WFI	a_wfi		LIV_SISTEMA
@@ -276,16 +274,6 @@ init_idt:
 
 /// @addtogroup procsyscalls
 /// @{
-
-////////////////////////////////////////////////////////
-/// Parte Assembler della primitiva inutile()
-	.extern c_inutile
-a_inutile:
-	call salva_stato
-	call c_inutile
-	call carica_stato
-	iretq
-////////////////////////////////////////////////////////
 
 /// Parte Assembler della primitiva activate_p()
 	.extern c_activate_p

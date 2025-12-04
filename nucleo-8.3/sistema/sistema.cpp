@@ -9,6 +9,14 @@
 #include <sysio.h>
 #include <boot.h>
 
+// =============================================================
+// [ASTRA] FASE 2: Costanti per lo Swap
+// =============================================================
+// Usiamo una zona del disco sicura (es. dopo i primi 10MB)
+const natl SWAP_START_LBA = 20480; // ~10MB dall'inizio
+const natl SWAP_SIZE_PAGES = 1024; // 1024 pagine = 4MB di swap
+// =============================================================
+
 /////////////////////////////////////////////////////////////////////////////////
 /// @addtogroup proc		Processi
 ///
@@ -464,6 +472,15 @@ struct des_frame {
 		/// prossimo frame libero (se il frame è libero)
 		natl prossimo_libero;
 	};
+	// =======================================================================
+	// [ASTRA] FASE 2: Mappa Inversa
+	// =======================================================================
+    // Questi campi ci dicono a chi appartiene questo frame fisico.
+    // Servono quando dobbiamo "rubarlo" (swap-out).
+    des_proc* proprietario; // Puntatore al processo che usa il frame
+    vaddr     ind_virtuale; // Indirizzo virtuale mappato su questo frame
+    bool      swappable;    // True se il frame può essere mandato su disco
+	// =======================================================================
 };
 
 /// Numero totale di frame (M1 + M2)
@@ -477,6 +494,18 @@ natq N_M2;
 
 /// Array dei descrittori di frame
 des_frame vdf[N_FRAME];
+
+// =======================================================================
+// [ASTRA] FASE 2: Variabili Globali Swap
+// =======================================================================
+// Bitmap per gestire lo spazio libero su disco (true = occupato, false = libero)
+// per semplicità uso un array di bool invece di bitmask complessi
+bool swap_map[SWAP_SIZE_PAGES];
+
+// indice per l'algoritmo di rimpiazzo (Clock Hand / FIFO)
+// punta al prossimo frame da controllare come possibile vittima
+natq next_victim_idx = 0;
+// =======================================================================
 
 /// Testa della lista dei frame liberi
 natq primo_frame_libero;
@@ -1438,6 +1467,26 @@ extern "C" void main(natq)
 	init_frame();
 	flog(LOG_INFO, "Numero di frame: %lu (M1) %lu (M2)", N_M1, N_M2);
 
+// =======================================================================
+// [ASTRA] FASE 2: Inizializzazione Swap
+// =======================================================================
+// Inizializza la swap map a "tutto libero"
+memset(swap_map, 0, sizeof(swap_map));
+// Inizializza l'indice della vittima al primo frame di M2 (la memoria allocabile)
+next_victim_idx = N_M1; 
+
+// I frame di M1 (sistema) non devono mai essere swappati
+for(natq i=0; i < N_M1; i++) {
+	vdf[i].swappable = false;
+	vdf[i].proprietario = nullptr;
+}
+// Anche i frame di M2 partono puliti
+for(natq i=N_M1; i < N_FRAME; i++) {
+	vdf[i].swappable = false; // Diventerà true solo quando allocato a un utente
+	vdf[i].proprietario = nullptr;
+}
+// =======================================================================
+
 	flog(LOG_INFO, "Suddivisione della memoria virtuale:");
 	flog(LOG_INFO, "- sis/cond [%16lx, %16lx)", ini_sis_c, fin_sis_c);
 	flog(LOG_INFO, "- sis/priv [%16lx, %16lx)", ini_sis_p, fin_sis_p);
@@ -1889,11 +1938,25 @@ bool gestore_page_fault(vaddr fault_addr) {
     paddr new_frame = alloca_frame();
     if (new_frame == 0) {
         panic("Astra: Memoria esaurita (Fase 1 - No Swap)");
+		// FASE 2b: Qui verrà chiamata swap_out()
     }
+
+// =======================================================================
+// [ASTRA] FASE 2: Registrazione Mappa Inversa
+// =======================================================================
+
+	vaddr page_base = fault_addr & ~(DIM_PAGINA - 1);
+
+    // Calcoliamo l'indice del frame nell'array vdf
+    natq frame_idx = new_frame / DIM_PAGINA;
+    
+    vdf[frame_idx].proprietario = esecuzione; // Il processo corrente è il proprietario
+    vdf[frame_idx].ind_virtuale = page_base;  // L'indirizzo virtuale (allineato)
+    vdf[frame_idx].swappable = true;          // È una pagina utente, quindi sacrificabile
+// =======================================================================
 
     // 3. Mappa il frame
     // Calcola l'inizio della pagina (allineamento a 4KiB)
-    vaddr page_base = fault_addr & ~(DIM_PAGINA - 1);
 
     // map vuole una funzione che restituisca il paddr. Usiamo una lambda.
     auto get_frame = [new_frame](vaddr v) -> paddr { return new_frame; };
@@ -1912,6 +1975,7 @@ bool gestore_page_fault(vaddr fault_addr) {
 
     return true; // Fault gestito con successo
 }
+// ============================================================================
 
 /// @}
 /// @}

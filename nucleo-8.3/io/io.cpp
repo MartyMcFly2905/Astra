@@ -10,6 +10,7 @@
 #include <sys.h>
 #include <sysio.h>
 #include <io.h>
+#include <astra_swap.h>
 
 ////////////////////////////////////////////////////////////////////////////////
 /// @addtogroup ioheap		Memoria Dinamica
@@ -24,6 +25,18 @@
 
 /// Indice del semaforo di mutua esclusione per lo heap I/O
 natl ioheap_mutex;
+
+bool astra_swap_richiesta_io_valida(const astra_swap_io_request& richiesta)
+{
+	if (richiesta.quanti_settori == 0)
+		return false;
+	if (richiesta.frame_fisico == 0 || richiesta.frame_fisico % DIM_PAGINA != 0)
+		return false;
+	if (richiesta.operazione != ASTRA_IO_SWAP_OUT &&
+			richiesta.operazione != ASTRA_IO_SWAP_IN)
+		return false;
+	return true;
+}
 
 /*! @brief Alloca un oggetto nello heap I/O.
  *  @param s		dimensione dell'oggetto

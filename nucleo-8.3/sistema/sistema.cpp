@@ -7,6 +7,7 @@
 #include <libce.h>
 #include <sys.h>
 #include <sysio.h>
+#include <astra_swap.h>
 #include <boot.h>
 
 /////////////////////////////////////////////////////////////////////////////////
@@ -399,23 +400,27 @@ void process_dump(des_proc*, log_sev sev);
  *  @param rip		instruction pointer salvato in pila
  */
 
- // !!! [ASTRA] Forward declaration della funzione in fondo
- bool gestore_page_fault(vaddr fault_addr);
- // Forward declaration per leggere il registro CR2 (indirizzo del fault)
- extern "C" vaddr readCR2();
+// !!! [ASTRA] Prototipi per la gestione dei page fault.
+// La funzione readCR2() restituisce l'indirizzo virtuale che ha causato il fault.
+bool gestore_page_fault(vaddr fault_addr);
+bool is_valid_stack_address(vaddr v);
+extern "C" vaddr readCR2();
+// [ASTRA_END]
+
 
 extern "C" void gestore_eccezioni(int tipo, natq errore, vaddr rip)
 {
-    // [ASTRA] FASE 1: Gestione Page Fault (#14)
-    if (tipo == 14) {
-        vaddr fault_addr = readCR2();
-        
-        // Proviamo a gestire il fault. Se restituisce true, problema risolto.
-        if (gestore_page_fault(fault_addr)) {
-            return; // Ritorna subito per rieseguire l'istruzione
-        }
-        // Se restituisce false, lasciamo che il codice qui sotto faccia panic/abort
-    }
+	// !!! [ASTRA] FASE 1 - Intercettazione controllata del page fault utente.
+	// Gestiamo solo fault di pagina non presente (#PF, bit P=0) generati
+	// da codice utente. Gli altri casi restano errori normali del nucleo.
+	if (tipo == 14 && (errore & PF_USER) && !(errore & PF_PROT)) {
+		vaddr fault_addr = readCR2();
+
+		if (gestore_page_fault(fault_addr)) {
+			return; // Fault risolto: la CPU ripetera' l'istruzione.
+		}
+	}
+	// [ASTRA_END]
 
 	log_exception(tipo, errore, rip);
 
@@ -456,6 +461,15 @@ extern "C" void gestore_eccezioni(int tipo, natq errore, vaddr rip)
 /// @{
 /////////////////////////////////////////////////////////////////////////////////
 
+/// Tipo d'uso registrato per un frame fisico.
+enum tipo_frame {
+	FRAME_LIBERO,
+	FRAME_TABELLA,
+	FRAME_PILA_SISTEMA,
+	FRAME_PAGINA_UTENTE,
+	FRAME_NON_RIMPIAZZABILE
+};
+
 /// Descrittore di frame
 struct des_frame {
 	union {
@@ -464,6 +478,12 @@ struct des_frame {
 		/// prossimo frame libero (se il frame è libero)
 		natl prossimo_libero;
 	};
+	/// uso corrente del frame
+	tipo_frame tipo;
+	/// processo proprietario, valido solo per pagine utente rimpiazzabili
+	des_proc* proprietario;
+	/// indirizzo virtuale della pagina utente mappata
+	vaddr ind_virtuale;
 };
 
 /// Numero totale di frame (M1 + M2)
@@ -483,6 +503,126 @@ natq primo_frame_libero;
 
 /// Numero di frame nella lista dei frame liberi
 natq num_frame_liberi;
+
+/// Prossimo frame da cui parte la ricerca circolare della vittima Astra.
+natq prossimo_frame_vittima;
+
+/// Bit software usato da Astra per riconoscere una PTE non residente.
+const natq ASTRA_BIT_SWAP = 1UL << 9;
+/// Numero di slot logici della swap map Astra.
+const natq ASTRA_NUM_SLOT_SWAP = 256;
+/// Primo settore riservato logicamente ad Astra.
+const natl ASTRA_PRIMO_SETTORE_SWAP = 4096;
+/// Numero di settori da 512 byte necessari per una pagina.
+const natb ASTRA_SETTORI_PER_PAGINA = DIM_PAGINA / 512;
+/// Bitmap semplice degli slot di swap logici.
+bool astra_slot_swap_libero[ASTRA_NUM_SLOT_SWAP];
+/// Numero di slot di swap ancora disponibili.
+natq astra_slot_swap_liberi;
+
+void pulisci_metadati_frame(natq i, tipo_frame tipo)
+{
+	vdf[i].tipo = tipo;
+	vdf[i].proprietario = nullptr;
+	vdf[i].ind_virtuale = 0;
+}
+
+void marca_frame(paddr f, tipo_frame tipo, des_proc* proprietario = nullptr,
+		vaddr ind_virtuale = 0)
+{
+	natq i = f / DIM_PAGINA;
+	vdf[i].tipo = tipo;
+	vdf[i].proprietario = proprietario;
+	vdf[i].ind_virtuale = ind_virtuale;
+}
+
+natq conta_frame_rimpiazzabili()
+{
+	natq n = 0;
+
+	for (natq i = N_M1; i < N_FRAME; i++) {
+		if (vdf[i].tipo == FRAME_PAGINA_UTENTE)
+			n++;
+	}
+	return n;
+}
+
+void log_frame_rimpiazzabili()
+{
+	flog(LOG_INFO, "Astra: frame utente rimpiazzabili: %lu", conta_frame_rimpiazzabili());
+}
+
+bool scegli_vittima_frame(natq& vittima)
+{
+	if (!N_M2)
+		return false;
+
+	if (prossimo_frame_vittima < N_M1 || prossimo_frame_vittima >= N_FRAME)
+		prossimo_frame_vittima = N_M1;
+
+	for (natq tentativi = 0; tentativi < N_M2; tentativi++) {
+		natq i = prossimo_frame_vittima;
+		prossimo_frame_vittima++;
+		if (prossimo_frame_vittima >= N_FRAME)
+			prossimo_frame_vittima = N_M1;
+
+		if (vdf[i].tipo == FRAME_PAGINA_UTENTE && vdf[i].proprietario) {
+			vittima = i;
+			return true;
+		}
+	}
+
+	return false;
+}
+
+bool log_vittima_astra(natq& vittima)
+{
+	if (!scegli_vittima_frame(vittima)) {
+		flog(LOG_WARN, "Astra: nessun frame utente rimpiazzabile trovato");
+		return false;
+	}
+
+	flog(LOG_INFO,
+			"Astra: vittima candidata frame %lu, proc %u, vaddr %lx",
+			vittima,
+			vdf[vittima].proprietario->id,
+			vdf[vittima].ind_virtuale);
+	return true;
+}
+
+void init_swap_map_astra()
+{
+	for (natq i = 0; i < ASTRA_NUM_SLOT_SWAP; i++)
+		astra_slot_swap_libero[i] = true;
+
+	astra_slot_swap_liberi = ASTRA_NUM_SLOT_SWAP;
+}
+
+bool alloca_slot_swap_astra(natq& slot)
+{
+	if (!astra_slot_swap_liberi)
+		return false;
+
+	for (natq i = 0; i < ASTRA_NUM_SLOT_SWAP; i++) {
+		if (astra_slot_swap_libero[i]) {
+			astra_slot_swap_libero[i] = false;
+			astra_slot_swap_liberi--;
+			slot = i;
+			return true;
+		}
+	}
+
+	return false;
+}
+
+void rilascia_slot_swap_astra(natq slot)
+{
+	if (slot >= ASTRA_NUM_SLOT_SWAP || astra_slot_swap_libero[slot])
+		return;
+
+	astra_slot_swap_libero[slot] = true;
+	astra_slot_swap_liberi++;
+}
 
 /*! @brief Inizializza la parte M2 e i descrittori di frame.
  *
@@ -504,6 +644,11 @@ void init_frame()
 	N_M1 = fine_M1 / DIM_PAGINA;
 	// numero di frame in M2
 	N_M2 = N_FRAME - N_M1;
+	prossimo_frame_vittima = N_M1;
+	init_swap_map_astra();
+
+	for (natq i = 0; i < N_M1; i++)
+		pulisci_metadati_frame(i, FRAME_NON_RIMPIAZZABILE);
 
 	if (!N_M2)
 		return;
@@ -522,7 +667,9 @@ void init_frame()
 	natq last = 0;
 	for (natq j = 0; j < N_STEP; j++) {
 		for (natq i = j; i < N_M2; i += N_STEP) {
-			vdf[primo_frame_libero + i].prossimo_libero =
+			natq frame = primo_frame_libero + i;
+			pulisci_metadati_frame(frame, FRAME_LIBERO);
+			vdf[frame].prossimo_libero =
 				primo_frame_libero + i + N_STEP;
 			num_frame_liberi++;
 			last = i;
@@ -544,7 +691,7 @@ paddr alloca_frame()
 	}
 	natq j = primo_frame_libero;
 	primo_frame_libero = vdf[primo_frame_libero].prossimo_libero;
-	vdf[j].prossimo_libero = 0;
+	pulisci_metadati_frame(j, FRAME_NON_RIMPIAZZABILE);
 	num_frame_liberi--;
 	return j * DIM_PAGINA;
 }
@@ -560,6 +707,7 @@ void rilascia_frame(paddr f)
 	}
 	// dal momento che i frame di M2 sono tutti equivalenti, è
 	// sufficiente inserire in testa
+	pulisci_metadati_frame(j, FRAME_LIBERO);
 	vdf[j].prossimo_libero = primo_frame_libero;
 	primo_frame_libero = j;
 	num_frame_liberi++;
@@ -575,6 +723,223 @@ void rilascia_frame(paddr f)
 /// @{
 /////////////////////////////////////////////////////////////////////////////////
 #include <vm.h>
+
+tab_entry crea_pte_swap_astra(natq slot)
+{
+	return ASTRA_BIT_SWAP | ((slot << 12) & ADDR_MASK);
+}
+
+bool pte_swap_astra(tab_entry e)
+{
+	return !(e & BIT_P) && (e & ASTRA_BIT_SWAP);
+}
+
+natq estrai_slot_swap_astra(tab_entry e)
+{
+	return (e & ADDR_MASK) >> 12;
+}
+
+void log_slot_swap_diagnostico_astra()
+{
+	natq slot;
+
+	if (!alloca_slot_swap_astra(slot)) {
+		flog(LOG_WARN, "Astra: nessuno slot di swap disponibile");
+		return;
+	}
+
+	tab_entry e = crea_pte_swap_astra(slot);
+
+	if (pte_swap_astra(e)) {
+		flog(LOG_INFO,
+				"Astra: PTE non residente simulata, slot %lu, marker %lx",
+				estrai_slot_swap_astra(e),
+				e);
+	}
+
+	rilascia_slot_swap_astra(slot);
+}
+
+enum astra_operazione_swap {
+	ASTRA_SWAP_OUT,
+	ASTRA_SWAP_IN
+};
+
+struct astra_richiesta_swap {
+	astra_operazione_swap operazione;
+	des_proc* proprietario;
+	vaddr ind_virtuale;
+	natq frame;
+	natq slot;
+	tab_entry pte_originale;
+	tab_entry pte_non_residente;
+};
+
+bool leggi_pte_vittima_astra(natq vittima, tab_entry& pte, paddr& frame_pte)
+{
+	des_proc* proprietario = vdf[vittima].proprietario;
+	vaddr ind_virtuale = vdf[vittima].ind_virtuale;
+
+	if (!proprietario)
+		return false;
+
+	for (tab_iter it(proprietario->cr3, ind_virtuale, DIM_PAGINA); it; it.next()) {
+		if (!it.is_leaf())
+			continue;
+
+		pte = it.get_e();
+		if (!(pte & BIT_P))
+			return false;
+
+		frame_pte = extr_IND_FISICO(pte);
+		return true;
+	}
+
+	return false;
+}
+
+bool richiesta_swap_valida_astra(const astra_richiesta_swap& richiesta);
+
+void log_richiesta_swap_astra(const astra_richiesta_swap& richiesta)
+{
+	const char* nome_operazione =
+		richiesta.operazione == ASTRA_SWAP_OUT ? "swap-out" : "swap-in";
+
+	flog(LOG_INFO,
+			"Astra: richiesta %s preparata, proc %u, vaddr %lx, frame %lu, slot %lu",
+			nome_operazione,
+			richiesta.proprietario->id,
+			richiesta.ind_virtuale,
+			richiesta.frame,
+			richiesta.slot);
+}
+
+bool costruisci_richiesta_io_swap_astra(const astra_richiesta_swap& richiesta,
+		astra_swap_io_request& richiesta_io)
+{
+	if (!richiesta_swap_valida_astra(richiesta))
+		return false;
+
+	richiesta_io.operazione =
+		richiesta.operazione == ASTRA_SWAP_OUT ? ASTRA_IO_SWAP_OUT : ASTRA_IO_SWAP_IN;
+	richiesta_io.ind_virtuale = richiesta.ind_virtuale;
+	richiesta_io.frame_fisico = richiesta.frame * DIM_PAGINA;
+	richiesta_io.slot = richiesta.slot;
+	richiesta_io.primo_settore =
+		ASTRA_PRIMO_SETTORE_SWAP + richiesta.slot * ASTRA_SETTORI_PER_PAGINA;
+	richiesta_io.quanti_settori = ASTRA_SETTORI_PER_PAGINA;
+	return true;
+}
+
+void log_richiesta_io_swap_astra(const astra_swap_io_request& richiesta_io)
+{
+	const char* nome_operazione =
+		richiesta_io.operazione == ASTRA_IO_SWAP_OUT ? "swap-out" : "swap-in";
+
+	flog(LOG_INFO,
+			"Astra: richiesta I/O %s pronta, frame %lx, slot %lu, settori [%u, +%hhu)",
+			nome_operazione,
+			richiesta_io.frame_fisico,
+			richiesta_io.slot,
+			richiesta_io.primo_settore,
+			richiesta_io.quanti_settori);
+}
+
+bool richiesta_swap_valida_astra(const astra_richiesta_swap& richiesta)
+{
+	if (!richiesta.proprietario)
+		return false;
+	if (!is_valid_stack_address(richiesta.ind_virtuale))
+		return false;
+	if (richiesta.frame < N_M1 || richiesta.frame >= N_FRAME)
+		return false;
+	if (vdf[richiesta.frame].tipo != FRAME_PAGINA_UTENTE)
+		return false;
+	if (richiesta.slot >= ASTRA_NUM_SLOT_SWAP)
+		return false;
+	return true;
+}
+
+void log_robustezza_astra(const astra_richiesta_swap& richiesta)
+{
+	if (richiesta_swap_valida_astra(richiesta)) {
+		flog(LOG_INFO,
+				"Astra: controlli robustezza superati per frame %lu e slot %lu",
+				richiesta.frame,
+				richiesta.slot);
+	} else {
+		flog(LOG_WARN, "Astra: controlli robustezza falliti sulla richiesta swap");
+	}
+}
+
+bool prepara_swap_in_diagnostico_astra(const astra_richiesta_swap& swap_out)
+{
+	if (!pte_swap_astra(swap_out.pte_non_residente)) {
+		flog(LOG_WARN, "Astra: swap-in non preparato, marker PTE non valido");
+		return false;
+	}
+
+	astra_richiesta_swap richiesta;
+	richiesta.operazione = ASTRA_SWAP_IN;
+	richiesta.proprietario = swap_out.proprietario;
+	richiesta.ind_virtuale = swap_out.ind_virtuale;
+	richiesta.frame = swap_out.frame;
+	richiesta.slot = estrai_slot_swap_astra(swap_out.pte_non_residente);
+	richiesta.pte_originale = swap_out.pte_non_residente;
+	richiesta.pte_non_residente = swap_out.pte_originale;
+
+	log_richiesta_swap_astra(richiesta);
+	flog(LOG_INFO,
+			"Astra: ripristino PTE simulato, non residente %lx -> presente %lx",
+			richiesta.pte_originale,
+			richiesta.pte_non_residente);
+	flog(LOG_INFO, "Astra: swap-in solo diagnostico, nessuna lettura da disco");
+	return true;
+}
+
+bool prepara_swap_out_diagnostico_astra(natq vittima, astra_richiesta_swap& richiesta)
+{
+	tab_entry pte_originale;
+	paddr frame_pte;
+
+	if (!leggi_pte_vittima_astra(vittima, pte_originale, frame_pte)) {
+		flog(LOG_WARN, "Astra: impossibile preparare swap-out, PTE vittima non valida");
+		return false;
+	}
+
+	paddr frame_atteso = vittima * DIM_PAGINA;
+	if (frame_pte != frame_atteso) {
+		flog(LOG_WARN,
+				"Astra: swap-out non preparato, frame PTE %lx diverso da %lx",
+				frame_pte,
+				frame_atteso);
+		return false;
+	}
+
+	natq slot;
+	if (!alloca_slot_swap_astra(slot)) {
+		flog(LOG_WARN, "Astra: swap-out non preparato, swap map esaurita");
+		return false;
+	}
+
+	richiesta.operazione = ASTRA_SWAP_OUT;
+	richiesta.proprietario = vdf[vittima].proprietario;
+	richiesta.ind_virtuale = vdf[vittima].ind_virtuale;
+	richiesta.frame = vittima;
+	richiesta.slot = slot;
+	richiesta.pte_originale = pte_originale;
+	richiesta.pte_non_residente = crea_pte_swap_astra(slot);
+
+	log_richiesta_swap_astra(richiesta);
+	flog(LOG_INFO,
+			"Astra: transizione PTE simulata, presente %lx -> non residente %lx",
+			richiesta.pte_originale,
+			richiesta.pte_non_residente);
+	flog(LOG_INFO, "Astra: richiesta non inviata al modulo I/O, disco non ancora usato");
+
+	rilascia_slot_swap_astra(slot);
+	return true;
+}
 
 /// @addtogroup ranges Parti della memoria virtuale dei processi
 ///
@@ -645,6 +1010,7 @@ paddr alloca_tab()
 	paddr f = alloca_frame();
 	if (f) {
 		memset(voidptr_cast(f), 0, DIM_PAGINA);
+		marca_frame(f, FRAME_TABELLA);
 		vdf[f / DIM_PAGINA].nvalide = 0;
 	}
 	return f;
@@ -856,13 +1222,22 @@ void clear_root_tab(paddr dest)
  *  @param liv		livello della pila (LIV_UTENTE o LIV_SISTEMA)
  *  @return		true se la creazione ha avuto successo, false altrimenti
  */
-bool crea_pila(paddr root_tab, vaddr bottom, natq size, natl liv)
+bool crea_pila(paddr root_tab, vaddr bottom, natq size, natl liv, des_proc* proprietario = nullptr)
 {
 	vaddr v = map(root_tab,
 		bottom - size,
 		bottom,
 		BIT_RW | (liv == LIV_UTENTE ? BIT_US : 0),
-		[](vaddr) { return alloca_frame(); });
+		[liv, proprietario](vaddr v) {
+			paddr f = alloca_frame();
+			if (!f)
+				return paddr(0);
+			if (liv == LIV_UTENTE)
+				marca_frame(f, FRAME_PAGINA_UTENTE, proprietario, v);
+			else
+				marca_frame(f, FRAME_PILA_SISTEMA);
+			return f;
+		});
 	if (v != bottom) {
 		unmap(root_tab, bottom - size, v,
 			[](vaddr, paddr p, int) { rilascia_frame(p); });
@@ -891,9 +1266,9 @@ void distruggi_pila(paddr root_tab, vaddr bottom, natq size)
 /*! @brief Funzione interna per la creazione di un processo.
  *
  *  Parte comune a activate_p() e activate_pe().  Alloca un id per il processo
- *  e crea e inizializza il descrittore di processo, la pila sistema e, per i
- *  processi di livello utente, la pila utente. Crea l'albero di traduzione
- *  completo per la memoria virtuale del processo.
+ *  e crea e inizializza il descrittore di processo e la pila sistema. Per i
+ *  processi utente Astra lascia la pila utente non mappata: le pagine vengono
+ *  allocate al primo accesso dal gestore di page fault.
  *
  *  @param f		corpo del processo
  *  @param a		parametro per il corpo del processo
@@ -936,7 +1311,7 @@ des_proc* crea_processo(void f(natq), natq a, int prio, char liv)
 
 	// creazione della pila sistema
 	static_assert(DIM_SYS_STACK > 0 && (DIM_SYS_STACK & 0xFFF) == 0);
-	if (!crea_pila(p->cr3, fin_sis_p, DIM_SYS_STACK, LIV_SISTEMA))
+	if (!crea_pila(p->cr3, fin_sis_p, DIM_SYS_STACK, LIV_SISTEMA, p))
 		goto err_rel_tab;
 	// otteniamo un puntatore al fondo della pila appena creata.  Si noti
 	// che non possiamo accedervi tramite l'indirizzo virtuale 'fin_sis_p',
@@ -964,18 +1339,16 @@ des_proc* crea_processo(void f(natq), natq a, int prio, char liv)
 		// passerà ad eseguire la prima istruzione della funzione f,
 		// usando come pila la pila utente (al suo indirizzo virtuale)
 
-// !!! [ASTRA] FASE 1: Disabilitiamo la creazione statica della pila.
-        // La pila verrà creata dinamicamente dal Page Fault Handler.
-        /*
-        static_assert(DIM_USR_STACK > 0 && (DIM_USR_STACK & 0xFFF) == 0);
-        if (!crea_pila(p->cr3, fin_utn_p, DIM_USR_STACK, LIV_UTENTE)) {
-            flog(LOG_WARN, "crea_processo: creazione pila utente fallita");
-            goto err_del_sstack;
-        }
-        */
+		// !!! [ASTRA] FASE 1 - Creazione leggera del processo utente.
+		// Non chiamiamo crea_pila() per la pila utente: lasciamo valido
+		// solo l'intervallo virtuale. La prima push/call in utente causera'
+		// un page fault, che verra' gestito on demand.
+		static_assert(DIM_USR_STACK > 0 && (DIM_USR_STACK & 0xFFF) == 0);
 
-        // NOTA: p->contesto[I_RSP] punta ancora a fin_utn_p (virtuale), 
-        // ma quella memoria non è mappata fisicamente!!!
+		// Nota scolastica: RSP punta alla pila utente virtuale, ma per ora
+		// non esiste nessun frame fisico associato a quelle pagine.
+		// [ASTRA_END]
+
 
 		// inizialmente, il processo si trova a livello sistema, come
 		// se avesse eseguito una istruzione INT, con la pila sistema
@@ -1018,7 +1391,6 @@ des_proc* crea_processo(void f(natq), natq a, int prio, char liv)
 
 	return p;
 
-err_del_sstack:	distruggi_pila(p->cr3, fin_sis_p, DIM_SYS_STACK);
 err_rel_tab:	clear_root_tab(p->cr3);
 		rilascia_tab(p->cr3);
 err_rel_id:	rilascia_proc_id(p->id);
@@ -1856,62 +2228,129 @@ void process_dump(des_proc* p, log_sev sev)
 
 
 // ============================================================================
-// !!! [ASTRA] IMPLEMENTAZIONE FASE 1
+// !!! [ASTRA] DEMAND PAGING DELLA PILA UTENTE
 // ============================================================================
 
-// Helper per verificare se l'indirizzo è nello stack utente
-bool is_valid_stack_address(vaddr v) {
-    // Calcoliamo l'inizio dello stack (es. 0 - 64KB = 0xFFFFFFFFFFFF0000)
-    vaddr stack_start = fin_utn_p - DIM_USR_STACK;
+// !!! [ASTRA] FASE 1 - Controllo dell'intervallo valido della pila utente.
+bool is_valid_stack_address(vaddr v)
+{
+	vaddr stack_start = fin_utn_p - DIM_USR_STACK;
 
-    if (fin_utn_p == 0) {
-        // Caso speciale: la pila tocca la fine della memoria (wrap-around a 0).
-        // Dato che v è unsigned, non può essere "minore" di 0.
-        // Ci basta controllare che sia sopra l'inizio.
-        return v >= stack_start;
-    } else {
-        // Caso normale
-        return (v >= stack_start) && (v < fin_utn_p);
-    }
+	if (fin_utn_p == 0) {
+		// Caso particolare: la pila finisce a 0 e quindi sta nella parte alta
+		// dello spazio virtuale. Con indirizzi unsigned basta questo controllo.
+		return v >= stack_start;
+	}
+
+	return v >= stack_start && v < fin_utn_p;
 }
+// [ASTRA_END]
 
-// Handler vero e proprio
-bool gestore_page_fault(vaddr fault_addr) {
-    // 1. Controllo validità: è un indirizzo della pila utente?
-    if (!is_valid_stack_address(fault_addr)) {
-        flog(LOG_WARN, "Astra: Page Fault non gestito a %lx (fuori stack)", fault_addr);
-        return false; // Non gestito -> Abort
-    }
+// !!! [ASTRA] FASE 5 - Controllo della PTE della vittima scelta.
+bool log_pte_vittima_astra(natq vittima)
+{
+	des_proc* proprietario = vdf[vittima].proprietario;
+	vaddr ind_virtuale = vdf[vittima].ind_virtuale;
+	paddr frame_atteso = vittima * DIM_PAGINA;
 
-    flog(LOG_INFO, "Astra: Demand Paging per %lx (Proc %d)", fault_addr, esecuzione->id);
+	if (!proprietario) {
+		flog(LOG_WARN, "Astra: vittima senza processo proprietario");
+		return false;
+	}
 
-    // 2. Alloca un frame fisico
-    paddr new_frame = alloca_frame();
-    if (new_frame == 0) {
-        panic("Astra: Memoria esaurita (Fase 1 - No Swap)");
-    }
+	for (tab_iter it(proprietario->cr3, ind_virtuale, DIM_PAGINA); it; it.next()) {
+		if (!it.is_leaf())
+			continue;
 
-    // 3. Mappa il frame
-    // Calcola l'inizio della pagina (allineamento a 4KiB)
-    vaddr page_base = fault_addr & ~(DIM_PAGINA - 1);
+		tab_entry e = it.get_e();
 
-    // map vuole una funzione che restituisca il paddr. Usiamo una lambda.
-    auto get_frame = [new_frame](vaddr v) -> paddr { return new_frame; };
+		if (!(e & BIT_P)) {
+			flog(LOG_WARN, "Astra: PTE vittima non presente per %lx", ind_virtuale);
+			return false;
+		}
 
-    map(esecuzione->cr3, page_base, page_base + DIM_PAGINA, 
-    BIT_US | BIT_RW, get_frame);
+		paddr frame_pte = extr_IND_FISICO(e);
+		if (frame_pte != frame_atteso) {
+			flog(LOG_WARN,
+					"Astra: PTE vittima incoerente, frame atteso %lx, trovato %lx",
+					frame_atteso,
+					frame_pte);
+			return false;
+		}
 
-    // 4. Pulisci il frame (Sicurezza)
-    // Usiamo la finestra FM per scrivere nello spazio fisico
-  	memset(voidptr_cast(new_frame), 0, DIM_PAGINA);
+		flog(LOG_INFO,
+				"Astra: PTE vittima verificata, proc %u, vaddr %lx, frame %lx",
+				proprietario->id,
+				ind_virtuale,
+				frame_pte);
+		return true;
+	}
 
-    // 5. Invalida TLB (Opzionale ma buona pratica su x86 dopo map)
-    // Qui non serve strettamente perché è un fault su pagina non presente,
-    // ma in futuro servirà.
-    invalida_entrata_TLB(page_base);
-
-    return true; // Fault gestito con successo
+	flog(LOG_WARN, "Astra: PTE vittima non trovata per %lx", ind_virtuale);
+	return false;
 }
+// [ASTRA_END]
+
+bool gestore_page_fault(vaddr fault_addr)
+{
+	// !!! [ASTRA] FASE 1 - Il fault deve cadere dentro la pila utente.
+	if (!is_valid_stack_address(fault_addr)) {
+		flog(LOG_WARN, "Astra: page fault fuori dalla pila utente: %lx", fault_addr);
+		return false;
+	}
+	// [ASTRA_END]
+
+	// !!! [ASTRA] FASE 1/2 - Allocazione lazy e registrazione del frame.
+	vaddr page_base = fault_addr & ~(DIM_PAGINA - 1);
+	paddr new_frame = alloca_frame();
+
+	if (new_frame == 0) {
+		flog(LOG_ERR, "Astra: memoria esaurita durante il demand paging");
+		log_frame_rimpiazzabili();
+		natq vittima;
+		if (log_vittima_astra(vittima)) {
+			log_pte_vittima_astra(vittima);
+			log_slot_swap_diagnostico_astra();
+			astra_richiesta_swap richiesta;
+			if (prepara_swap_out_diagnostico_astra(vittima, richiesta)) {
+				log_robustezza_astra(richiesta);
+				astra_swap_io_request richiesta_io;
+				if (costruisci_richiesta_io_swap_astra(richiesta, richiesta_io))
+					log_richiesta_io_swap_astra(richiesta_io);
+				prepara_swap_in_diagnostico_astra(richiesta);
+			}
+		}
+		panic("Astra: memoria esaurita durante il demand paging");
+	}
+
+	memset(voidptr_cast(new_frame), 0, DIM_PAGINA);
+
+	auto get_frame = [new_frame](vaddr) -> paddr {
+		return new_frame;
+	};
+
+	vaddr mapped_until = map(
+		esecuzione->cr3,
+		page_base,
+		page_base + DIM_PAGINA,
+		BIT_US | BIT_RW,
+		get_frame);
+
+	if (mapped_until != page_base + DIM_PAGINA) {
+		rilascia_frame(new_frame);
+		flog(LOG_WARN, "Astra: mappatura lazy fallita per %lx", page_base);
+		return false;
+	}
+
+	marca_frame(new_frame, FRAME_PAGINA_UTENTE, esecuzione, page_base);
+	invalida_entrata_TLB(page_base);
+
+	flog(LOG_INFO, "Astra: pagina di pila allocata on demand a %lx, frame %lx",
+			page_base, new_frame);
+	log_frame_rimpiazzabili();
+	return true;
+}
+// [ASTRA_END]
 
 /// @}
 /// @}

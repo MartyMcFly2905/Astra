@@ -42,6 +42,13 @@ If the physical memory (RAM) is exhausted, Astra does not crash uncontrollably. 
 - **Non-Resident PTE:** A custom format for the Page Table Entry (PTE) where the present bit is 0 (`P=0`), a custom software bit marks the swapped page nature, and the physical address space holds the logical swap sector.
 - **I/O Contract:** Assembly of an `astra_swap_io_request` struct ready to be dispatched to a block driver module. (The actual disk write step is currently deliberately omitted to maintain focus on MMU management).
 
+### Design Choices and Intentional Incompleteness
+
+An earlier experimental version of Astra attempted to implement the full disk swap by adding block device I/O code directly into `sistema.cpp`. 
+This approach was eventually discarded because it broke the modularity of the kernel, mixing system responsibilities with I/O module duties. 
+
+Therefore, **Astra is intentionally incomplete regarding physical disk writes**. The project aims to demonstrate a solid understanding of memory management (MMU, Page Faults, TLB, PTE) without compromising the architectural cleanliness of the OS. The `astra_swap_io_request` serves as a bridge, ready to be integrated when a proper inter-process communication (IPC) or queuing mechanism with the I/O driver is implemented in future iterations.
+
 ### How to Run Tests
 Astra includes a memory pressure test to trigger Out-Of-Memory (OOM) conditions.
 
@@ -96,6 +103,13 @@ Qualora la memoria fisica (RAM) si esaurisse, Astra non va in blocco in modo inc
 - **Scelta della Vittima:** Scansione circolare dei frame utente rimpiazzabili per trovare una pagina da espellere.
 - **PTE Non Residente:** Formato custom per la Page Table Entry (PTE) dove il bit di presenza è a 0 (`P=0`), un bit software segna la natura della pagina swappata, e lo spazio dell'indirizzo fisico contiene il Logical Slot Sector del disco.
 - **Contratto I/O:** Compilazione della richiesta `astra_swap_io_request` inviabile a un modulo driver a blocchi. (Attualmente lo step di invio reale su I/O non è implementato per mantenere il focus sulla gestione MMU).
+
+### Scelte Progettuali e Incompletezza Intenzionale
+
+Una precedente versione sperimentale di Astra tentava di implementare lo swap completo scrivendo il codice di I/O del disco direttamente all'interno di `sistema.cpp`. 
+Questo approccio è stato successivamente abbandonato (tramite rollback) perché rompeva la modularità del kernel, mischiando le responsabilità del sistema con i compiti del modulo I/O.
+
+Per questo motivo, **Astra è volutamente incompleto per quanto riguarda la scrittura fisica su disco**. L'obiettivo del progetto è dimostrare una solida comprensione della gestione della memoria (MMU, Page Fault, TLB, PTE) senza compromettere la pulizia architetturale del Sistema Operativo. Il contratto `astra_swap_io_request` funge da ponte, pronto per essere integrato quando verrà sviluppato un adeguato meccanismo di code o IPC (Inter-Process Communication) con il driver I/O in sviluppi futuri.
 
 ### Come Eseguire i Test
 

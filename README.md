@@ -49,6 +49,15 @@ This approach was eventually discarded because it broke the modularity of the ke
 
 Therefore, **Astra is intentionally incomplete regarding physical disk writes**. The project aims to demonstrate a solid understanding of memory management (MMU, Page Faults, TLB, PTE) without compromising the architectural cleanliness of the OS. The `astra_swap_io_request` serves as a bridge, ready to be integrated when a proper inter-process communication (IPC) or queuing mechanism with the I/O driver is implemented in future iterations.
 
+### Navigating the Code
+If you want to read the source code and distinguish Astra's modifications from the vanilla `nucleo-8.3` kernel, you can simply search for the `[ASTRA]` tag. Every custom implementation is explicitly enclosed in comment blocks like this:
+
+```cpp
+// !!! [ASTRA] 
+// Astra-specific code and comments here...
+// [ASTRA_END]
+```
+
 ### How to Run Tests
 Astra includes a memory pressure test to trigger Out-Of-Memory (OOM) conditions.
 
@@ -110,6 +119,15 @@ Una precedente versione sperimentale di Astra tentava di implementare lo swap co
 Questo approccio è stato successivamente abbandonato (tramite rollback) perché rompeva la modularità del kernel, mischiando le responsabilità del sistema con i compiti del modulo I/O.
 
 Per questo motivo, **Astra è volutamente incompleto per quanto riguarda la scrittura fisica su disco**. L'obiettivo del progetto è dimostrare una solida comprensione della gestione della memoria (MMU, Page Fault, TLB, PTE) senza compromettere la pulizia architetturale del Sistema Operativo. Il contratto `astra_swap_io_request` funge da ponte, pronto per essere integrato quando verrà sviluppato un adeguato meccanismo di code o IPC (Inter-Process Communication) con il driver I/O in sviluppi futuri.
+
+### Esplorare il Codice
+Se desideri leggere il codice sorgente e distinguere agevolmente le modifiche di Astra dal kernel `nucleo-8.3` originale (vanilla), puoi semplicemente cercare il tag `[ASTRA]`. Ogni nuova implementazione è racchiusa esplicitamente in blocchi di commento come questo:
+
+```cpp
+// !!! [ASTRA] 
+// Codice e commenti specifici di Astra qui...
+// [ASTRA_END]
+```
 
 ### Come Eseguire i Test
 
